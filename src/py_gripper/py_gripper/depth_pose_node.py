@@ -43,16 +43,39 @@ REFERENCE_PATH = os.path.join(get_package_share_directory('py_gripper'),
 
 
 class MjpegServer:
-    """Serve the latest debug frame as MJPEG, the same way the FoundationPose
-    script does, so bring-up needs nothing but a browser.
+    """Serve the latest frames as MJPEG, so bring-up needs nothing but a browser.
 
-    Port 8091 rather than 8090 so it never collides with that script if it
-    happens to still be running. Built on http.server to avoid pulling Flask
-    into the ROS environment.
+    Two views, because they answer different questions. The annotated one says
+    what the detector decided; the raw one says what it had to work with, which
+    is what you want when it decided nothing -- a panel half out of frame, a
+    glare patch, the gripper's own shadow across the ports. Reading those off
+    the annotated view is hard precisely when it matters, since a frame that
+    failed carries almost no annotation.
+
+    Port 8091 rather than 8090 so it never collides with the FoundationPose
+    script if that happens to still be running. Built on http.server to avoid
+    pulling Flask into the ROS environment.
     """
+
+    PAGE = b"""<!doctype html><meta charset=utf-8><title>depth_pose_node</title>
+<style>
+ body{margin:0;background:#111;color:#ccc;font:13px system-ui,sans-serif}
+ .wrap{display:flex;flex-wrap:wrap;gap:12px;padding:12px}
+ figure{margin:0;flex:1 1 420px}
+ figcaption{padding:4px 2px;color:#8a8a8a}
+ img{width:100%;height:auto;background:#000;border-radius:4px}
+</style>
+<div class=wrap>
+ <figure><img src="/stream"><figcaption>detected &mdash; blue outline is the
+  panel, green circles are the ports it matched, red crosses are where the
+  solved pose puts them (the gap between the two is the reprojection error)
+  </figcaption></figure>
+ <figure><img src="/raw"><figcaption>raw camera</figcaption></figure>
+</div>"""
 
     def __init__(self, port=8091, logger=None):
         self.frame = None
+        self.raw = None
         self.lock = threading.Lock()
         self.port = port
         outer = self
@@ -62,7 +85,18 @@ class MjpegServer:
                 pass                                  # keep it out of the ROS log
 
             def do_GET(self):
-                if self.path not in ('/', '/stream'):
+                if self.path in ('/', '/index.html'):
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.send_header('Content-Length', str(len(outer.PAGE)))
+                    self.end_headers()
+                    self.wfile.write(outer.PAGE)
+                    return
+                if self.path == '/stream':
+                    attr = 'frame'
+                elif self.path == '/raw':
+                    attr = 'raw'
+                else:
                     self.send_error(404)
                     return
                 self.send_response(200)
@@ -72,7 +106,7 @@ class MjpegServer:
                 try:
                     while True:
                         with outer.lock:
-                            buf = outer.frame
+                            buf = getattr(outer, attr)
                         if buf is None:
                             time.sleep(0.05)
                             continue
@@ -86,13 +120,30 @@ class MjpegServer:
         self.server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         if logger:
-            logger.info(f'debug stream on http://localhost:{port}/')
+            logger.info(f'debug stream on http://localhost:{port}/  '
+                        f'(annotated /stream, raw /raw)')
+
+    def _encode(self, bgr, max_side):
+        scale = max_side / max(bgr.shape[:2])
+        if scale < 1.0:
+            bgr = cv2.resize(bgr, None, fx=scale, fy=scale,
+                             interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return buf.tobytes() if ok else None
 
     def update(self, bgr):
-        ok, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if ok:
+        buf = self._encode(bgr, 900)
+        if buf:
             with self.lock:
-                self.frame = buf.tobytes()
+                self.frame = buf
+
+    def update_raw(self, bgr, max_side=640):
+        """The camera frame as it arrived. Scaled down -- this is for looking at,
+        and shipping 1280x720 at frame rate to a browser buys nothing."""
+        buf = self._encode(bgr, max_side)
+        if buf:
+            with self.lock:
+                self.raw = buf
 
 
 class HeadingLock:
@@ -223,6 +274,9 @@ class DepthPoseNode(Node):
         bgr = np.ascontiguousarray(a[:, :, ::-1] if msg.encoding == 'rgb8' else a)
         self.bgr = bgr
         self.grey = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        # published whatever happens downstream: the frame that produced no pose
+        # is exactly the one worth being able to look at
+        self.stream.update_raw(bgr)
         if self.method != 'mono' or self.K is None:
             return
         # In mono mode this callback is the pipeline -- the depth stream is only
@@ -320,20 +374,35 @@ class DepthPoseNode(Node):
         grey, bgr = self.grey, self.bgr
         ports = self.ref['ports']
 
-        mask, outline = mpl.platform_mask(grey)
-        if mask is None:
+        # Which dark blob is the part is settled by whether the CAD pattern
+        # registers inside it, not by how it looks. The gripper's own black body,
+        # a cable and a monitor bezel have between them outscored the real panel
+        # on brightness and shape -- they are all just dark rectangles -- so the
+        # blobs are tried in order and the first one that yields ports wins.
+        blobs = mpl.platform_candidates(grey)
+        if not blobs:
             return None, 'no dark part found in the frame', None
-        px_hint = mpl.silhouette_scale(outline, self.ref['work_size_m'])
-        if not px_hint:
-            return None, 'part footprint unusable', None
-
-        cands, match = mpl.find_ports(grey, mask, px_hint, ports, K=self.K)
+        mask = outline = px_hint = None
+        cands, match = [], None
+        for k, (m_, o_) in enumerate(blobs):
+            hint = mpl.silhouette_scale(o_, self.ref['work_size_m'])
+            if not hint:
+                continue
+            c_, mt_ = mpl.find_ports(grey, m_, hint, ports, K=self.K)
+            if mask is None:                    # keep the best-scoring for debug
+                mask, outline, px_hint, cands = m_, o_, hint, c_
+            if mt_ is not None and mt_.get('verified'):
+                mask, outline, px_hint, cands, match = m_, o_, hint, c_, mt_
+                if k:
+                    self.get_logger().info(
+                        f'the top dark blob held no ports; used candidate {k + 1} '
+                        f'of {len(blobs)}', throttle_duration_sec=10)
+                break
         ctx = (bgr, outline, cands, None, ports, None, None, None)
-        if len(cands) < 4:
-            return None, f'only {len(cands)} port candidates inside the part', ctx
         if match is None:
-            return None, (f'{len(cands)} candidates did not register against the '
-                          f'{len(ports)}-port CAD table'), ctx
+            return None, (f'no dark region registered against the {len(ports)}-port '
+                          f'CAD table ({len(blobs)} tried, best had {len(cands)} '
+                          f'port candidates)'), ctx
 
         img = np.array([cands[di]['centre'] for _, di in match['pairs']])
         sol = mpl.solve_pose(match['pairs'], ports, img, self.K)

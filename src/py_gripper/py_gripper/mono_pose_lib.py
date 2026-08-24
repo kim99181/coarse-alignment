@@ -29,14 +29,22 @@ import numpy as np
 
 # ---------------------------------------------------------------- the part
 
-def platform_mask(grey, min_area=2000, close_px=9, fill_px=31):
-    """Find the part: the dark blob on a pale table. -> (mask, outline) or (None, None).
+def platform_candidates(grey, min_area=2000, close_px=9, fill_px=31, max_n=4):
+    """Dark blobs that could be the part, best first. -> [(mask, outline), ...].
 
-    Otsu over the whole frame rather than anything cleverer, because black
-    against a white bench is the easiest threshold in the pipeline and the one
-    stage that has never failed. The result only has to be good enough to bound
-    the search for ports -- a ragged edge costs nothing here, unlike in the depth
-    route where the same silhouette had to carry the scale as well.
+    Otsu over the whole frame, because black against a pale bench is the
+    easiest threshold in the pipeline. Then rank by area x fill ratio rather
+    than area alone: cable runs and the shadowed edge of the bench are dark too
+    and can carry more pixels than the part while filling a fraction of their
+    bounding box, where the part fills about 0.9 of its own.
+
+    Several are returned rather than one, and that matters. On hardware the top
+    blob has been the gripper's own black body merged with a cable and a monitor
+    bezel, while the real panel sat second because it was half out of frame. No
+    ranking over brightness and shape alone separates those reliably -- they are
+    all just dark rectangles. What does separate them is whether the CAD's port
+    pattern registers inside, so the caller tries these in order and keeps the
+    first that does. On a clean frame that is the first one and costs nothing.
     """
     _, dark = cv2.threshold(grey, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     dark = cv2.morphologyEx(
@@ -44,32 +52,35 @@ def platform_mask(grey, min_area=2000, close_px=9, fill_px=31):
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px, close_px)))
     n, lab, st, _ = cv2.connectedComponentsWithStats(dark, 8)
 
-    # Largest *solid* blob, not simply largest. Cable runs and the shadowed edge
-    # of the bench are dark too and can carry more pixels than the part while
-    # filling a fraction of their bounding box; the part fills ~0.9 of its own.
-    best, best_score = None, 0.0
+    scored = []
     for i in range(1, n):
         a = int(st[i, cv2.CC_STAT_AREA])
         if a < min_area:
             continue
         box = int(st[i, cv2.CC_STAT_WIDTH]) * int(st[i, cv2.CC_STAT_HEIGHT])
-        score = a * (a / box)
-        if score > best_score:
-            best, best_score = i, score
-    if best is None:
-        return None, None
+        scored.append((a * (a / box), i))
+    scored.sort(reverse=True)
 
-    blob = (lab == best).astype(np.uint8) * 255
-    blob = cv2.morphologyEx(
-        blob, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fill_px, fill_px)))
-    cnts, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None, None
-    outline = max(cnts, key=cv2.contourArea)
-    mask = np.zeros_like(grey)
-    cv2.drawContours(mask, [outline], -1, 255, -1)   # ports filled back in
-    return mask, outline
+    out = []
+    for _, i in scored[:max_n]:
+        blob = (lab == i).astype(np.uint8) * 255
+        blob = cv2.morphologyEx(
+            blob, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fill_px, fill_px)))
+        cnts, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        outline = max(cnts, key=cv2.contourArea)
+        mask = np.zeros_like(grey)
+        cv2.drawContours(mask, [outline], -1, 255, -1)   # ports filled back in
+        out.append((mask, outline))
+    return out
+
+
+def platform_mask(grey, **kw):
+    """The best-scoring dark blob. -> (mask, outline) or (None, None)."""
+    got = platform_candidates(grey, max_n=1, **kw)
+    return got[0] if got else (None, None)
 
 
 def silhouette_scale(outline, work_size_m):
