@@ -167,7 +167,8 @@ def port_candidates(grey, mask, px_per_m, cad_ports, block=None, offset=-12,
 
 
 def find_ports(grey, mask, px_per_m, cad_ports, K=None, dist=None,
-               offsets=(-12, -8, -18, -6, -25), min_candidates=4, **kw):
+               offsets=(-12, -8, -18, -6, -25), scales=(1.0, 0.6, 1.5, 0.35),
+               min_candidates=4, **kw):
     """Detect and match together, retrying the threshold. -> (candidates, match).
 
     One threshold setting is one guess at how much darker than its surroundings
@@ -180,24 +181,38 @@ def find_ports(grey, mask, px_per_m, cad_ports, K=None, dist=None,
     verified result, not just a high count, is what keeps this loop from
     settling for the same wrong-but-full-count hypothesis on every attempt.
 
+    `px_per_m` is retried at several multiples for the same reason, and that one
+    is not a refinement. It arrives from the part's silhouette, which is only as
+    good as the segmentation: when the panel's dark blob merges with something
+    else dark behind it -- a monitor bezel, the gripper's own body -- the
+    silhouette is of the merged region and the scale comes out far too high.
+    Measured on such a frame it read 5601 px/m against a true 1900, which put
+    every port outside the area band and left two candidates. The merged mask
+    itself was fine; feeding the same mask a scale anywhere between 1500 and
+    3000 matched seven or eight ports at a consistent 350 mm.
+
     The common case costs one attempt: the loop stops as soon as an attempt
-    verifies all but one port.
+    verifies all but one port. On the frame above it took three, 268 ms in all,
+    against 18 ms when the first scale is right -- worth paying on a frame that
+    was otherwise producing nothing.
     """
     best = (([], None), -1, False)
-    for offset in offsets:
-        cands = port_candidates(grey, mask, px_per_m, cad_ports,
-                                offset=offset, **kw)
-        if len(cands) < min_candidates:
-            if len(cands) > best[1]:
-                best = ((cands, None), len(cands), False)
-            continue
-        match = match_ports(cands, cad_ports, px_per_m, K=K, dist=dist)
-        verified = bool(match and match.get('verified'))
-        score = match['n_matched'] if match else 0
-        if (verified, score) > (best[2], best[1]):
-            best = ((cands, match), score, verified)
-        if verified and score >= len(cad_ports) - 1:
-            break
+    for scale in scales:
+        px = px_per_m * scale
+        for offset in offsets:
+            cands = port_candidates(grey, mask, px, cad_ports,
+                                    offset=offset, **kw)
+            if len(cands) < min_candidates:
+                if len(cands) > best[1]:
+                    best = ((cands, None), len(cands), False)
+                continue
+            match = match_ports(cands, cad_ports, px, K=K, dist=dist)
+            verified = bool(match and match.get('verified'))
+            score = match['n_matched'] if match else 0
+            if (verified, score) > (best[2], best[1]):
+                best = ((cands, match), score, verified)
+            if verified and score >= len(cad_ports) - 1:
+                return best[0]
     return best[0]
 
 
