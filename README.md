@@ -70,6 +70,19 @@ ros2 run py_gripper arm_cmd --ros-args -p part:=server1
 `ROS_LOCALHOST_ONLY=1` is not optional on a shared lab network -- another
 machine on the default domain will otherwise publish into the same topics.
 
+### Settings that do not travel
+
+Three things in `config/` and one in the launch file are specific to the rig
+they were measured on. On the same robot they carry over; on a different one
+they do not, and using them unchanged will put the arm in the wrong place:
+
+| | |
+|---|---|
+| `config/ICA_Lab_UMI_Config.yaml` | hand-eye calibration -- where the camera sits on the flange, including its 24.4 deg tilt |
+| `config/opening_reference.json` | port table, valid only for the panel it was generated from |
+| `robot_ip` in `launch/tmr_depth_launch.py` | |
+| `table_z`, `roll_usb`, `roll_hdmi`, `roll_rj45` on `arm_cmd` | bench height, and how each plug sits in the jaws |
+
 ### Commands
 
 | | |
@@ -87,14 +100,17 @@ Port names come from the CAD table: `usb1`-`usb4`, `rj451`, `rj452`,
 
 ## Adding a panel
 
-Put the STL in `tools/build_reference.py`'s `MESHES`, then:
+Models live in `src/py_gripper/cad/`. Drop the STL there, add it to
+`tools/build_reference.py`'s `MESHES`, then:
 
 ```bash
 ~/.local/bin/micromamba run -n foundationpose python tools/build_reference.py
 ```
 
 It ray-casts the port face, measures each opening and writes
-`config/opening_reference.json`.
+`config/opening_reference.json` -- the table the runtime actually reads. The
+models for the panels here are committed, so a fresh clone can regenerate that
+table rather than having to trust the copy in the repository.
 
 One thing worth knowing when designing the panel: make the port layout
 asymmetric under **reflection and a half turn**, not just under rotation. The

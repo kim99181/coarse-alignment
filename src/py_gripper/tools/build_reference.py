@@ -25,9 +25,13 @@ from scipy import ndimage
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from py_gripper import depth_pose_lib as dpl
 
+# Models live in the package's own cad/ directory so a fresh clone can rebuild
+# the port table without hunting for files. A path outside the package is still
+# accepted -- pass one on the command line -- but nothing here depends on one.
+CAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cad')
 MESHES = {
-    'rj45_test': os.path.expanduser('~/FoundationPose/objects/rj45_test/rj45_test.obj'),
-    'server1': os.path.expanduser('~/Downloads/server1_all.STL'),
+    'rj45_test': os.path.join(CAD_DIR, 'rj45_test.obj'),
+    'server1': os.path.join(CAD_DIR, 'server1_all.STL'),
 }
 
 # Ports are told apart by how deep their cavity is -- a far cleaner signal than
