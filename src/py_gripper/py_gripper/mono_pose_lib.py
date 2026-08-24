@@ -168,7 +168,7 @@ def port_candidates(grey, mask, px_per_m, cad_ports, block=None, offset=-12,
 
 def find_ports(grey, mask, px_per_m, cad_ports, K=None, dist=None,
                offsets=(-12, -8, -18, -6, -25), scales=(1.0, 0.6, 1.5, 0.35),
-               min_candidates=4, **kw):
+               prefer=None, min_candidates=4, **kw):
     """Detect and match together, retrying the threshold. -> (candidates, match).
 
     One threshold setting is one guess at how much darker than its surroundings
@@ -196,23 +196,35 @@ def find_ports(grey, mask, px_per_m, cad_ports, K=None, dist=None,
     against 18 ms when the first scale is right -- worth paying on a frame that
     was otherwise producing nothing.
     """
+    # Whatever worked last frame is tried first. Both ladders exist for frames
+    # that need them, but a scene changes far more slowly than it is sampled, so
+    # a frame that needed the third scale and the fourth offset almost certainly
+    # still does -- and paying the search again every frame is what turns a
+    # recovery path into a permanent 3 Hz. With the winner tried first the
+    # merged-silhouette case settles back to roughly the cost of a clean frame.
+    order = [(sc, off) for sc in scales for off in offsets]
+    if prefer in order:
+        order.remove(prefer)
+        order.insert(0, prefer)
+
     best = (([], None), -1, False)
-    for scale in scales:
+    for scale, offset in order:
         px = px_per_m * scale
-        for offset in offsets:
-            cands = port_candidates(grey, mask, px, cad_ports,
-                                    offset=offset, **kw)
-            if len(cands) < min_candidates:
-                if len(cands) > best[1]:
-                    best = ((cands, None), len(cands), False)
-                continue
-            match = match_ports(cands, cad_ports, px, K=K, dist=dist)
-            verified = bool(match and match.get('verified'))
-            score = match['n_matched'] if match else 0
-            if (verified, score) > (best[2], best[1]):
-                best = ((cands, match), score, verified)
-            if verified and score >= len(cad_ports) - 1:
-                return best[0]
+        cands = port_candidates(grey, mask, px, cad_ports,
+                                offset=offset, **kw)
+        if len(cands) < min_candidates:
+            if len(cands) > best[1]:
+                best = ((cands, None), len(cands), False)
+            continue
+        match = match_ports(cands, cad_ports, px, K=K, dist=dist)
+        verified = bool(match and match.get('verified'))
+        score = match['n_matched'] if match else 0
+        if match is not None:
+            match['tried'] = (scale, offset)
+        if (verified, score) > (best[2], best[1]):
+            best = ((cands, match), score, verified)
+        if verified and score >= len(cad_ports) - 1:
+            return best[0]
     return best[0]
 
 

@@ -382,17 +382,25 @@ class DepthPoseNode(Node):
         blobs = mpl.platform_candidates(grey)
         if not blobs:
             return None, 'no dark part found in the frame', None
+        # Start from the blob that worked last time, for the same reason
+        # find_ports starts from the scale that worked last time.
+        prev_blob = getattr(self, '_last_blob', 0)
+        order = sorted(range(len(blobs)), key=lambda i: (i != prev_blob, i))
         mask = outline = px_hint = None
         cands, match = [], None
-        for k, (m_, o_) in enumerate(blobs):
+        for k in order:
+            m_, o_ = blobs[k]
             hint = mpl.silhouette_scale(o_, self.ref['work_size_m'])
             if not hint:
                 continue
-            c_, mt_ = mpl.find_ports(grey, m_, hint, ports, K=self.K)
+            c_, mt_ = mpl.find_ports(grey, m_, hint, ports, K=self.K,
+                                     prefer=getattr(self, '_last_tried', None))
             if mask is None:                    # keep the best-scoring for debug
                 mask, outline, px_hint, cands = m_, o_, hint, c_
             if mt_ is not None and mt_.get('verified'):
                 mask, outline, px_hint, cands, match = m_, o_, hint, c_, mt_
+                self._last_blob = k
+                self._last_tried = mt_.get('tried')
                 if k:
                     self.get_logger().info(
                         f'the top dark blob held no ports; used candidate {k + 1} '
