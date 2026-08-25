@@ -25,6 +25,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     part = LaunchConfiguration('part')
     method = LaunchConfiguration('method')
+    task_json = LaunchConfiguration('task_json')
 
     realsense_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -52,6 +53,10 @@ def generate_launch_description():
             'part', default_value='rj45_test',
             description='key in config/opening_reference.json to track'),
         DeclareLaunchArgument(
+            'task_json', default_value='',
+            description='upstream task file naming the panel and target socket; '
+                        'overrides part when given'),
+        DeclareLaunchArgument(
             'method', default_value='mono',
             description="'mono' solves the pose from colour alone against the "
                         "CAD port table; 'depth' is the original measure-first "
@@ -64,5 +69,6 @@ def generate_launch_description():
 
         Node(package='py_gripper', executable='depth_pose_node',
              name='depth_pose_node',
-             parameters=[{'part': part, 'method': method}]),
+             parameters=[{'part': part, 'method': method,
+                          'task_json': task_json}]),
     ])

@@ -10,6 +10,7 @@ import os
 import rclpy
 from rclpy.node import Node
 from ament_index_python.packages import get_package_share_directory
+from py_gripper import task_file
 import numpy as np
 from scipy.spatial.transform import Rotation
 import threading
@@ -51,6 +52,19 @@ class ArmCmd(Node):
         self.set_positions_req = SetPositions.Request()
         self.set_event_req = SetEvent.Request()
         self.declare_parameter('part', 'rj45_test')
+        # An upstream task file naming the panel and the target socket. When
+        # given it overrides `part`, and hole/holexy with no port name use its
+        # target. Only those two fields are read -- see py_gripper/task_file.py
+        # for why the coordinates in it are deliberately ignored.
+        self.declare_parameter('task_json', '')
+        # With a task file given, square up over its target and descend this far
+        # as soon as the node has a vision lock. Set auto_drop_m to 0 to align
+        # without descending, or auto_run to false to do nothing until told.
+        self.declare_parameter('auto_run', True)
+        self.declare_parameter('auto_drop_m', 0.20)
+        # A pause before that first move, so a mistaken launch can be caught
+        # with Ctrl-C rather than with the arm already moving. 0 disables it.
+        self.declare_parameter('auto_delay_s', 3.0)
         # Height of the bench top in world/base coordinates. The arm reports
         # tool_pose against its own base frame, and nothing in the driver knows
         # where the table is, so the one command that is specified relative to
@@ -88,6 +102,8 @@ class ArmCmd(Node):
         self.declare_parameter('roll_default', 0.0)
         self.part = self.get_parameter('part').value
         self._ports = None
+        self.task_port = None
+        self._load_task(self.get_parameter('task_json').value)
         self.target_positions = [0.2, -0.4, 0.35, 3.14159, 0.0, -1.57]
         self.current_positions = [0.2, -0.4, 0.35, 3.14159, 0.0, -1.57]
         
@@ -128,22 +144,7 @@ class ArmCmd(Node):
         target[2] -= drop
         if not self.target_is_sane(target):
             return None
-        table_z = float(self.get_parameter('table_z').value)
-        part_h = float(self.get_parameter('part_height_m').value)
-        source = 'measured'
-        if part_h <= 0.0:
-            source = 'CAD'
-            try:
-                part_h = float(json.load(open(os.path.join(
-                    get_package_share_directory('py_gripper'), 'config',
-                    'opening_reference.json')))[self.part].get('work_height_m', 0.0))
-            except (OSError, KeyError, ValueError, TypeError):
-                part_h = 0.0
-        above_table = target[2] - table_z
-        note = f'{above_table*100:.1f}cm above the bench'
-        if part_h > 0:
-            note += (f', {(above_table - part_h)*100:.1f}cm above the part '
-                     f'({part_h*100:.1f}cm tall, {source})')
+        note = self.clearance_note(target[2])
         self.get_logger().info(
             f'descend {drop*100:.0f}cm straight down -> '
             f'{[round(v, 4) for v in target]}  ({note})')
@@ -207,6 +208,33 @@ class ArmCmd(Node):
             return None
         return self.send_request(target)
 
+    def clearance_note(self, z):
+        """What will be left underneath if the tool goes to this height.
+
+        Reported rather than enforced. Descending is the direction that can hit
+        something, and the useful thing before committing is the remaining gap
+        -- to the bench and to the top of the part standing on it. Note it is
+        measured to the tool_pose the driver reports, so whatever is held in
+        the jaws hangs below the number shown.
+        """
+        table_z = float(self.get_parameter('table_z').value)
+        part_h = float(self.get_parameter('part_height_m').value)
+        source = 'measured'
+        if part_h <= 0.0:
+            source = 'CAD'
+            try:
+                part_h = float(json.load(open(os.path.join(
+                    get_package_share_directory('py_gripper'), 'config',
+                    'opening_reference.json')))[self.part].get('work_height_m', 0.0))
+            except (OSError, KeyError, ValueError, TypeError):
+                part_h = 0.0
+        above_table = z - table_z
+        note = f'{above_table*100:.1f}cm above the bench'
+        if part_h > 0:
+            note += (f', {(above_table - part_h)*100:.1f}cm above the part '
+                     f'({part_h*100:.1f}cm tall, {source})')
+        return note
+
     def _port_geometry(self, port=None):
         """Where the target opening sits in the object's own frame.
 
@@ -216,6 +244,10 @@ class ArmCmd(Node):
         by name -- vision never has to tell a USB from an HDMI, which is the one
         thing it would be unreliable at.
         """
+        # No port named on the command line falls back to the task file's
+        # target, so `holexy` alone means "the socket the job is about".
+        if port is None and self.task_port:
+            port = self.task_port
         if port is None:
             return (HOLE_CENTRE_IN_MESH, HOLE_LONG_AXIS_IN_MESH,
                     'single opening', None)
@@ -248,6 +280,87 @@ class ArmCmd(Node):
         return (np.array(p['centre']), np.array(p['long_axis']) * flip,
                 f"{port} ({p['kind']}{', flipped' if flip < 0 else ''})",
                 p['kind'])
+
+    def _load_task(self, path):
+        """Take the panel and target socket from an upstream task file.
+
+        Failure here is reported and then tolerated: the file only sets two
+        defaults that can equally be given on the command line, so a bad path
+        should not stop the arm coming up. What it must not do is fail quietly
+        and leave the previous panel selected, which would send every command
+        to the right-shaped socket on the wrong table.
+        """
+        if not path:
+            return
+        try:
+            task = task_file.read_task(path)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            self.get_logger().error(f'cannot read task file: {e}')
+            return
+        refs_path = os.path.join(get_package_share_directory('py_gripper'),
+                                 'config', 'opening_reference.json')
+        try:
+            refs = json.load(open(refs_path))
+        except OSError as e:
+            self.get_logger().error(f'cannot read {refs_path}: {e}')
+            return
+        part = task_file.resolve_part(task['part_raw'], refs)
+        if part is None:
+            self.get_logger().error(
+                f'task file names panel {task["part_raw"]!r}, which is not in '
+                f'{refs_path} (have {sorted(refs)}) -- keeping {self.part!r}')
+            return
+        self.part = part
+        self._ports = None                       # force a reload for the new panel
+        self.task_port = task['port']
+        self.get_logger().info(task_file.describe(task, part))
+
+        names = {p['name'] for p in refs[part].get('ports', [])}
+        if names and task['port'] not in names:
+            self.get_logger().error(
+                f'target {task["port"]!r} is not a port on {part!r} '
+                f'(have {sorted(names)}) -- name one explicitly')
+            self.task_port = None
+
+    def wait_for_vision(self, timeout=20.0):
+        """Block until a world-frame object pose has arrived. -> bool.
+
+        The automatic move must not start before vision has a lock. Without
+        this the pose is simply None at startup and the move is skipped, which
+        looks like the feature not working; worse, on a restart the arm could
+        act on a pose left over from wherever the panel used to be.
+        """
+        t0 = time.time()
+        warned = False
+        while time.time() - t0 < timeout:
+            if self.latest_object_pose is not None and self.current_positions:
+                return True
+            if not warned and time.time() - t0 > 2.0:
+                self.get_logger().info(
+                    'waiting for the vision node to report a panel pose...')
+                warned = True
+            time.sleep(0.1)
+        return False
+
+    def run_task(self, drop=None, roll_deg=0.0, move=True):
+        """The job the task file describes: square up over its target and descend.
+
+        One motion, not two. The controller interpolates to a single target
+        pose, so the turn and the descent happen together; stopping level first
+        would only add a pause.
+        """
+        if not self.task_port:
+            self.get_logger().warn('no task target loaded; nothing to run')
+            return None
+        if drop is None:
+            drop = float(self.get_parameter('auto_drop_m').value)
+        if not self.wait_for_vision():
+            self.get_logger().error(
+                'no panel pose after 20s -- is the vision node running and '
+                'does the debug stream show the ports? not moving')
+            return None
+        return self.align_hole_xy(roll_deg=roll_deg, move=move,
+                                  port=self.task_port, drop=drop)
 
     def roll_for_kind(self, kind):
         """Automatic roll for this kind of plug, in degrees."""
@@ -361,18 +474,32 @@ class ArmCmd(Node):
             hole_pos + normal * standoff, R_world_flange,
             f'align_to_hole [{port or "hole"}] standoff={standoff} roll={roll_deg}deg', move)
 
-    def align_hole_xy(self, roll_deg=0.0, move=True, port=None):
-        # Same squaring-up rotation as align_to_hole, but XY only: Z stays at
-        # whatever height the arm is already at, so orientation and XY can be
-        # dialled in without the tool ever creeping closer to the work.
+    def align_hole_xy(self, roll_deg=0.0, move=True, port=None, drop=0.0):
+        """Square up over a port. XY and orientation from vision, Z relative.
+
+        With drop=0 the tool never gets closer to the work, which is what makes
+        this safe to repeat while dialling in an alignment. With a drop it
+        becomes a single combined move -- the turn and the descent happen
+        together rather than as two commands, because the arm interpolates to
+        one target pose and there is nothing to be gained by making it stop
+        level first.
+        """
         f = self._hole_frame(roll_deg, port)
         if f is None:
             return None
         hole_pos, _normal, R_world_flange = f
-        target_pos = np.array([hole_pos[0], hole_pos[1], self.current_positions[2]])
+        target_pos = np.array([hole_pos[0], hole_pos[1],
+                               self.current_positions[2] - drop])
+        # The drop is relative to where the arm happens to be, so the same
+        # command lands somewhere different depending on the starting height.
+        # Say what will be left underneath rather than leaving that to be
+        # worked out from two numbers on separate lines.
+        where = (f'descending {drop*100:.0f}cm -> {self.clearance_note(target_pos[2])}'
+                 if drop else 'keeping current Z')
         return self._send_hole_target(
             target_pos, R_world_flange,
-            f'align_hole_xy [{port or "hole"}] (keeping current Z) roll={roll_deg}deg', move)
+            f'align_hole_xy [{port or self.task_port or "hole"}] ({where}) '
+            f'roll={roll_deg}deg', move)
 
     def align_xy(self):
         # keep Z (and current height) exactly where the arm already is;
@@ -637,6 +764,21 @@ def main(args=None):
     spin_thread = threading.Thread(target=rclpy.spin, args=(armCmd,), daemon=True)
     spin_thread.start()
 
+    # A task file means the job is already decided, so run it rather than
+    # waiting to be told again. Without one nothing happens here and the
+    # prompt below behaves exactly as it always has.
+    if armCmd.task_port and armCmd.get_parameter('auto_run').value:
+        drop = float(armCmd.get_parameter('auto_drop_m').value)
+        delay = float(armCmd.get_parameter('auto_delay_s').value)
+        armCmd.get_logger().info(
+            f'task loaded: will square up over {armCmd.task_port!r} and '
+            f'descend {drop*100:.0f}cm, as one move.')
+        if delay > 0:
+            armCmd.get_logger().info(
+                f'starting in {delay:.0f}s -- Ctrl-C now to stop')
+            time.sleep(delay)
+        armCmd.run_task(drop=drop)
+
     while True:
         raw = input("Positions: ").strip()
         # "h" / "h 10cm" / "h 10cm dry" -- straight down, pose untouched.
@@ -647,6 +789,22 @@ def main(args=None):
             continue
         if raw in ('xy', 'align'):
             armCmd.align_xy()
+            continue
+        # "task" alone reports the loaded job; "task <path>" loads another.
+        # "go" / "go 20cm" / "go dry" -- the task file's job: square up over
+        # its target and descend, in one move.
+        if raw.split() and raw.split()[0] in ('go', 'run'):
+            _p, roll, dry, drop = parse_hole_args(raw.split()[1:])
+            armCmd.run_task(drop=drop, roll_deg=roll, move=not dry)
+            continue
+        if raw.split() and raw.split()[0] == 'task':
+            arg = raw.split(maxsplit=1)
+            if len(arg) > 1:
+                armCmd._load_task(arg[1].strip('"\''))
+            else:
+                armCmd.get_logger().info(
+                    f'panel {armCmd.part!r}, target '
+                    f'{armCmd.task_port or "(none -- name one per command)"}')
             continue
         # "ready" / "ready 30cm" / "ready dry" -- starting pose for a run:
         # a set height above the table with the flange face levelled.
@@ -664,8 +822,9 @@ def main(args=None):
             continue
         # "holexy" / "holexy 90" / "holexy 90 dry" -- same alignment, Z untouched
         if raw.split() and raw.split()[0] in ('holexy', 'hxy'):
-            port, roll, dry, _standoff = parse_hole_args(raw.split()[1:])
-            armCmd.align_hole_xy(roll_deg=roll, move=not dry, port=port)
+            port, roll, dry, drop = parse_hole_args(raw.split()[1:])
+            armCmd.align_hole_xy(roll_deg=roll, move=not dry, port=port,
+                                 drop=drop or 0.0)
             continue
         positions = list(map(float, raw.split()))
         if len(positions) == 3:

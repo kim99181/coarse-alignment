@@ -34,6 +34,7 @@ from tm_msgs.msg import FeedbackState
 
 from py_gripper import depth_pose_lib as dpl
 from py_gripper import mono_pose_lib as mpl
+from py_gripper import task_file
 from py_gripper.fp_pose_bridge import (
     load_T_G_C, tool_pose_is_sane, tool_pose_to_matrix, rotmat_to_quat,
     FEEDBACK_MAX_AGE_S)
@@ -196,6 +197,10 @@ class DepthPoseNode(Node):
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('object_frame', 'object')
         self.declare_parameter('part', 'rj45_test')
+        # Same upstream task file arm_cmd reads. Here only the panel name
+        # matters -- it selects the CAD table -- but the target is taken too,
+        # so the debug stream highlights the socket the job is about.
+        self.declare_parameter('task_json', '')
         # 'mono' solves the pose from the colour image alone, against the CAD
         # port table; 'depth' is the original route, which measures the part
         # first. Mono is the default for anything with a port table because the
@@ -224,6 +229,24 @@ class DepthPoseNode(Node):
 
         with open(REFERENCE_PATH) as f:
             refs = json.load(f)
+
+        task_path = self.get_parameter('task_json').value
+        self.task_port = None
+        if task_path:
+            try:
+                task = task_file.read_task(task_path)
+                resolved = task_file.resolve_part(task['part_raw'], refs)
+                if resolved is None:
+                    self.get_logger().error(
+                        f'task file names panel {task["part_raw"]!r}, not in '
+                        f'{REFERENCE_PATH} (have {sorted(refs)}) -- '
+                        f'keeping {part!r}')
+                else:
+                    part, self.task_port = resolved, task['port']
+                    self.get_logger().info(task_file.describe(task, part))
+            except (OSError, ValueError, json.JSONDecodeError) as e:
+                self.get_logger().error(f'cannot read task file: {e}')
+
         if part not in refs:
             raise RuntimeError(f'{part!r} not in {REFERENCE_PATH}; '
                                f'have {sorted(refs)} -- run tools/build_reference.py')
@@ -358,7 +381,8 @@ class DepthPoseNode(Node):
     def _publish_mono_debug(self, ctx, stamp):
         if not self.get_parameter('publish_debug_image').value:
             return
-        target = self.get_parameter('target_port').value or None
+        target = (self.get_parameter('target_port').value
+                  or getattr(self, 'task_port', None) or None)
         vis = mpl.debug_image(*ctx, self.K, target=target)
         self._send_debug(vis, stamp)
 
