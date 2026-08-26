@@ -85,13 +85,18 @@ they do not, and using them unchanged will put the arm in the wrong place:
 
 ### Driving it from a task file
 
-A planner upstream emits a task file naming the panel and the socket. Point
-both nodes at it and the job runs itself:
+A planner upstream emits a task file naming the panel and the socket. One is
+committed at `src/py_gripper/tasks/robot_script.json` -- point both nodes at it
+and the job runs itself:
 
 ```bash
-ros2 launch py_gripper tmr_depth_launch.py task_json:="/path/to/robot script.json"
-ros2 run py_gripper arm_cmd --ros-args -p task_json:="/path/to/robot script.json"
+ros2 launch py_gripper tmr_depth_launch.py task_json:=src/py_gripper/tasks/robot_script.json
+ros2 run py_gripper arm_cmd --ros-args -p task_json:=src/py_gripper/tasks/robot_script.json
 ```
+
+Run those from the workspace root, or give an absolute path. To target a
+different socket, edit `target_feature_id` in that file, or name a port on the
+command line -- `go rj451` overrides it for one move without touching the file.
 
 `arm_cmd` then squares up over the target and descends `auto_drop_m` (20 cm by
 default) as a single move, once vision has a lock. Only two fields are read --

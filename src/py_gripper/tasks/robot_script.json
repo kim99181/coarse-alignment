@@ -1,0 +1,147 @@
+{
+  "schema_version": "1.1",
+  "server": "server_1",
+  "server_size_mm": {
+    "width": 150.0,
+    "height": 100.0
+  },
+  "server_frame": {
+    "name": "server_canonical",
+    "origin": "detected_server_front_surface_center",
+    "x_positive": "image_right",
+    "y_positive": "image_up",
+    "z_positive": "toward_camera"
+  },
+  "execution_architecture": {
+    "grasp": "pretrained_skill",
+    "insertion": "pretrained_skill",
+    "motion_planning": "MoveIt_or_runtime_executor",
+    "feature_semantics": "deterministic_then_gpt_vision",
+    "feature_coordinates": "feature_database_lookup"
+  },
+  "source": {
+    "human_script": "human_script.json",
+    "feature_database": "feature_database.json",
+    "reference_image": "front_annotated.jpg",
+    "semantic_model": "gpt-5.6",
+    "server_model": "2"
+  },
+  "allowed_robot_actions": [
+    "ALIGN_WITH_TARGET",
+    "GRASP_SKILL",
+    "INSERTION_SKILL",
+    "MOVE_ABOVE_TARGET",
+    "OPEN_GRIPPER",
+    "PLACE_AT_TARGET",
+    "PRESS_TARGET",
+    "PUSH_ALONG_TARGET_AXIS",
+    "RETRACT_FROM_TARGET"
+  ],
+  "converted_subtasks": [
+    {
+      "human_sequence_number": 1,
+      "human_action": "pick",
+      "original_instruction": "夾取 USB connector",
+      "target_description": null,
+      "selected_feature_id": null,
+      "feature_resolution_method": "not_required",
+      "target_local_position_m": null,
+      "robot_step_ids": [
+        "R001"
+      ]
+    },
+    {
+      "human_sequence_number": 2,
+      "human_action": "move",
+      "original_instruction": "移動到第一排網路孔上方",
+      "target_description": "第一排網路孔",
+      "selected_feature_id": "rj452",
+      "feature_resolution_method": "gpt_vision",
+      "target_local_position_m": [
+        -0.0511813362044751,
+        0.023148634133121702,
+        -0.009000003337860107
+      ],
+      "robot_step_ids": [
+        "R002"
+      ]
+    },
+    {
+      "human_sequence_number": 3,
+      "human_action": "insert",
+      "original_instruction": "插入第一排網路孔",
+      "target_description": "第一排網路孔",
+      "selected_feature_id": "rj452",
+      "feature_resolution_method": "gpt_vision",
+      "target_local_position_m": [
+        -0.0511813362044751,
+        0.023148634133121702,
+        -0.009000003337860107
+      ],
+      "robot_step_ids": [
+        "R003"
+      ]
+    }
+  ],
+  "robot_steps": [
+    {
+      "step_id": "R001",
+      "action": "GRASP_SKILL",
+      "source_human_sequence": 1,
+      "source_human_action": "pick",
+      "parameters": {
+        "skill_name": "grasp_skill",
+        "object": "USB connector",
+        "grasp_type": "precision",
+        "execution_mode": "pretrained_skill",
+        "requires_object_localization": true
+      }
+    },
+    {
+      "step_id": "R002",
+      "action": "MOVE_ABOVE_TARGET",
+      "source_human_sequence": 2,
+      "source_human_action": "move",
+      "parameters": {
+        "target_object": "server",
+        "target_feature_id": "rj452",
+        "target_local_position_m": [
+          -0.0511813362044751,
+          0.023148634133121702,
+          -0.009000003337860107
+        ],
+        "target_description": "第一排網路孔",
+        "approach_offset_m": [
+          0.0,
+          0.0,
+          0.1
+        ],
+        "requires_runtime_server_registration": true
+      }
+    },
+    {
+      "step_id": "R003",
+      "action": "INSERTION_SKILL",
+      "source_human_sequence": 3,
+      "source_human_action": "insert",
+      "parameters": {
+        "skill_name": "insertion_skill",
+        "target_object": "server",
+        "target_feature_id": "rj452",
+        "target_local_position_m": [
+          -0.0511813362044751,
+          0.023148634133121702,
+          -0.009000003337860107
+        ],
+        "target_description": "第一排網路孔",
+        "execution_mode": "pretrained_skill",
+        "requires_runtime_server_registration": true,
+        "requires_target_orientation": true,
+        "approach_distance_m": 0.03,
+        "max_insertion_distance_m": 0.02,
+        "speed_scale": 0.15
+      }
+    }
+  ],
+  "server_model": "2"
+}
