@@ -83,20 +83,69 @@ they do not, and using them unchanged will put the arm in the wrong place:
 | `robot_ip` in `launch/tmr_depth_launch.py` | |
 | `table_z`, `roll_usb`, `roll_hdmi`, `roll_rj45` on `arm_cmd` | bench height, and how each plug sits in the jaws |
 
+### Driving it from a task file
+
+A planner upstream emits a task file naming the panel and the socket. Point
+both nodes at it and the job runs itself:
+
+```bash
+ros2 launch py_gripper tmr_depth_launch.py task_json:="/path/to/robot script.json"
+ros2 run py_gripper arm_cmd --ros-args -p task_json:="/path/to/robot script.json"
+```
+
+`arm_cmd` then squares up over the target and descends `auto_drop_m` (20 cm by
+default) as a single move, once vision has a lock. Only two fields are read --
+the panel and the target socket. The coordinates in the file are ignored on
+purpose: this system measures the same panel per frame against its CAD, and the
+estimate re-derived from the current image is the one that stays true when the
+panel is nudged.
+
+Without a task file nothing runs automatically and every command below behaves
+as it always has. Pass `part:=server1` in that case, so the right CAD table is
+loaded.
+
+| parameter | |
+|---|---|
+| `auto_run` | set false to load the task but not act on it |
+| `auto_drop_m` | how far to descend on that first move (default 0.20) |
+| `auto_delay_s` | pause before it, 0 by default; set 1-2 while trying something new |
+
 ### Commands
 
 | | |
 |---|---|
-| `ready [45cm] [dry]` | park above the bench, flange level |
-| `holexy <port> [roll] [dry]` | square up over a port, height unchanged |
-| `hole <port> [roll] [5cm] [dry]` | as above, and stand off from the port face |
+| `go [port] [roll] [20cm] [dry]` | square up over the target **and descend**, one move |
+| `holexy [port] [roll] [20cm] [dry]` | square up over a port; descends only if given a distance |
+| `hole [port] [roll] [5cm] [dry]` | square up, and stand off from the port **face** |
 | `h [5cm\|5mm] [dry]` | straight down, pose untouched |
+| `ready [45cm] [dry]` | park above the bench, flange level |
+| `xy` | move over the panel centre, height unchanged |
+| `task` / `task <path>` | show the loaded job, or load another |
+| `x y z` / `x y z rx ry rz` | move to a pose directly |
 | `1` / `0` | gripper open / close |
 
-`dry` prints the target without moving, and is worth using every time.
+Arguments are recognised by shape rather than position, so they can be given in
+any order: a bare word is a port name, a bare number is a roll angle, anything
+suffixed `cm` or `mm` is a distance, and `dry` prints the target without moving.
+`go usb2 90 15cm dry` reads the way it looks.
+
+With a task file loaded, `go`, `holexy` and `hole` use its target when no port
+is named.
+
+Note that `cm` means two different things, deliberately. On `hole` it is an
+absolute height above the port face; on `go`, `holexy` and `h` it is how far to
+descend from wherever the arm is now. The relative ones report what will be
+left underneath before they move.
+
+`dry` is worth using every time. The distances are all measured to the
+`tool_pose` the driver reports, so whatever is held in the jaws hangs below the
+number shown.
 
 Port names come from the CAD table: `usb1`-`usb4`, `rj451`, `rj452`,
-`hdmi1`, `hdmi2`. A debug stream runs at <http://localhost:8091/>.
+`hdmi1`, `hdmi2`. A debug stream runs at <http://localhost:8091/>, showing the
+detection and the raw camera frame side by side -- the raw one because a frame
+that produced no pose carries almost no annotation, which is exactly when you
+need to see what the detector was given.
 
 ## Adding a panel
 
