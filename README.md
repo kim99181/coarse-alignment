@@ -152,6 +152,82 @@ detection and the raw camera frame side by side -- the raw one because a frame
 that produced no pose carries almost no annotation, which is exactly when you
 need to see what the detector was given.
 
+### Running a whole cycle
+
+`arm_cmd` does one socket and stops. A job is several cables, and this system
+performs only one of the things each cable needs -- the insertion and the next
+grasp belong to other programs -- so `arm_cmd_cycle` is mostly a loop of
+waiting:
+
+| | |
+|---|---|
+| align + descend | this program |
+| pause | insertion program drives the plug home and opens the jaws |
+| back to the start pose | this program |
+| pause | grasp program fetches the next cable |
+
+It subclasses `ArmCmd`, so finding a socket, matching it against the CAD and
+turning to it are the same code; `arm_cmd` itself is untouched and still behaves
+exactly as described above. Two cycles are committed:
+
+| | |
+|---|---|
+| `tasks/robot_script_cycle.json` | `usb1 -> rj452 -> hdmi1` |
+| `tasks/robot_script_cycle2.json` | `rj451 -> rj452 -> usb3 -> hdmi2` |
+
+A run begins with a cable already in the jaws, so set the arm up by hand first.
+This program never touches the gripper, where `arm_cmd` opens it on startup --
+which is the point, since opening it would drop the cable before the first move.
+
+```bash
+ros2 run py_gripper arm_cmd                      # no task file
+```
+
+`ready`, put the cable in the jaws, `0` to close, then place the arm where the
+camera sees the whole panel. Ctrl-C, and:
+
+```bash
+ros2 run py_gripper arm_cmd_cycle --ros-args \
+    -p task_json:=src/py_gripper/tasks/robot_script_cycle2.json
+```
+
+That pose is recorded at the start of the run and returned to between sockets,
+as a plain move to remembered numbers with no camera in the loop. An earlier
+version asked vision to re-centre instead and that stalled runs after the first
+socket: from 25 cm up and off to one side the panel is not recognisable enough
+to aim with, and refusing to aim with a stale pose means refusing to continue.
+Going back to one pose also keeps every socket measured from the same view,
+rather than each one further off-axis than the last.
+
+| parameter | |
+|---|---|
+| `insert_pause_s` | hand-off to the insertion program (default 3) |
+| `regrasp_pause_s` | hand-off to the grasp program (default 5) |
+| `sequence` | `"usb1,rj452,hdmi1"`, overriding the task file |
+| `home_keep_heading` | carry the wrist's heading home instead of restoring the recorded one |
+| `max_heading_swing_deg` | refuse a target that would turn the wrist further (default 150) |
+| `lift_first` | retract straight up before travelling home |
+| `settle_s`, `fresh_frames` | how long to stand still, and how many new panel poses to wait for, before trusting one |
+
+Two commands are added to the prompt -- `seq [ports...] [20cm] [dry]` to run a
+cycle by hand, and `home` / `home set` to return to the recorded start pose or
+record a new one. Everything in the table above still works, `seq dry` included,
+which walks the whole run printing each target without moving.
+
+#### Joint 6, and why the order matters
+
+Every socket on this panel shares one long axis, so what sets a socket's heading
+is its kind: usb and hdmi take a quarter turn, rj45 takes none, leaving the two
+90 deg apart. Grouping sockets by kind therefore costs the wrist less --
+`cycle2` turns it once in the whole run, where `cycle` alternates kinds and
+turns twice.
+
+It also makes `xy` a poor way to start a cycle. Its heading is hardcoded to
+rz = -90 deg, which is half a turn from an rj45's, and the controller reports
+such a target as out of range. Place the arm by hand instead. A turn past
+`max_heading_swing_deg` is refused with an explanation rather than left to fault
+mid-move, and the turn each move needs is printed either way.
+
 ## Adding a panel
 
 Models live in `src/py_gripper/cad/`. Drop the STL there, add it to
