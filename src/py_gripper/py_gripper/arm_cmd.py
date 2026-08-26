@@ -64,7 +64,7 @@ class ArmCmd(Node):
         self.declare_parameter('auto_drop_m', 0.20)
         # A pause before that first move, so a mistaken launch can be caught
         # with Ctrl-C rather than with the arm already moving. 0 disables it.
-        self.declare_parameter('auto_delay_s', 3.0)
+        self.declare_parameter('auto_delay_s', 1.0)
         # Height of the bench top in world/base coordinates. The arm reports
         # tool_pose against its own base frame, and nothing in the driver knows
         # where the table is, so the one command that is specified relative to
