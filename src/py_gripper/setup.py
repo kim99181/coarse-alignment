@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'arm_cmd = py_gripper.arm_cmd:main',
+            'arm_cmd_cycle = py_gripper.arm_cmd_cycle:main',
             'arm_script = py_gripper.arm_script:main',
             'arm = py_gripper.arm:main',
             'joy = py_gripper.joy:main',
