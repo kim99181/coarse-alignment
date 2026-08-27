@@ -212,6 +212,29 @@ class DepthPoseNode(Node):
         self.declare_parameter('target_port', '')
         self.declare_parameter('min_opening_area', 2e-5)
         self.declare_parameter('max_opening_area', 5e-4)
+        # Once a pose is in hand, search inside the part's own rectangle
+        # projected from it rather than inside a dark region picked out of the
+        # image. Segmentation is then only needed to get started and to
+        # recover, which matters because thresholding cannot separate the part
+        # from anything dark it touches -- the gripper's body, a cable, a
+        # remote control lying beside it on the bench. Nor can depth, for the
+        # last of those: it sits at much the same range.
+        self.declare_parameter('track_mask', True)
+        # Slack around that rectangle. The nearest port centre is 19 mm inside
+        # the short edge, so a centimetre is free.
+        self.declare_parameter('track_margin_m', 0.010)
+        # Consecutive frames that fail to register before the pose is dropped
+        # and the search goes back to the whole image. This is the price of
+        # tracking anything: a wrong pose projects a wrong rectangle, ports get
+        # found inside it, and the mistake confirms itself. Letting it go after
+        # a few empty frames is what stops that being permanent.
+        self.declare_parameter('track_max_miss', 5)
+        # How bright the part is allowed to be, against its surroundings, for a
+        # pose over it to be believed. See mono_pose_lib.looks_like_part: this
+        # is the check that catches a pose which is simply somewhere else, and
+        # nothing already in the pipeline can, because a false match reprojects
+        # as well as a true one. Set above 1 to switch it off.
+        self.declare_parameter('max_part_brightness', 0.6)
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('stream_port', 8091)
         # height band above the fitted table that counts as "the work"
@@ -268,6 +291,9 @@ class DepthPoseNode(Node):
         self.grey = None            # and its greyscale, which is what gets read
         self.depth = None           # kept even in mono mode, for the tilt check
         self.heading = HeadingLock()
+        self._last_pose = None      # (rvec, tvec) of the last frame that solved
+        self._track_miss = 0
+        self._footprint = None      # that pose's rectangle, for the debug view
 
         self.pose_pub = self.create_publisher(PoseStamped, 'camera_frame/object_pose', 10)
         self.world_pose_pub = self.create_publisher(PoseStamped, 'world_frame/object_pose', 10)
@@ -368,6 +394,8 @@ class DepthPoseNode(Node):
         self._send_debug(dpl.debug_image(rect, openings, chosen, axis, axis_y), stamp)
 
     def _send_debug(self, vis, stamp):
+        if vis is None or vis.size == 0:
+            return
         self.stream.update(vis)
         msg = Image()
         msg.header.stamp = stamp
@@ -379,12 +407,66 @@ class DepthPoseNode(Node):
         self.debug_pub.publish(msg)
 
     def _publish_mono_debug(self, ctx, stamp):
+        """Draw the annotated view. Never let drawing it stop the node.
+
+        This runs inside the colour subscription callback, where an exception
+        does not merely lose a frame -- it unwinds out of spin() and ends the
+        process, taking the pose stream and this debug stream with it. A view
+        for looking at must not be able to do that, so anything that goes wrong
+        while rendering is reported and the frame dropped.
+        """
         if not self.get_parameter('publish_debug_image').value:
             return
         target = (self.get_parameter('target_port').value
                   or getattr(self, 'task_port', None) or None)
-        vis = mpl.debug_image(*ctx, self.K, target=target)
-        self._send_debug(vis, stamp)
+        try:
+            vis = mpl.debug_image(*ctx, self.K, target=target,
+                                  footprint=self._footprint)
+            self._send_debug(vis, stamp)
+        except Exception as e:                        # noqa: BLE001
+            self.get_logger().error(
+                f'debug view not drawn this frame: {type(e).__name__}: {e}',
+                throttle_duration_sec=5)
+
+    def _tracked_mask(self, shape):
+        """The part's rectangle from the last pose. -> (mask, outline, px, tag).
+
+        None when tracking is off, when no pose has been solved yet, or when
+        the rectangle projects clean off the frame.
+        """
+        if not self.get_parameter('track_mask').value:
+            return None
+        if self._last_pose is None or self.K is None:
+            return None
+        rvec, tvec = self._last_pose
+        ports = self.ref.get('ports') or []
+        if not ports:
+            return None
+        poly = mpl.cad_footprint(
+            rvec, tvec, self.K, self.ref['work_size_m'],
+            float(ports[0]['centre'][2]),
+            margin_m=float(self.get_parameter('track_margin_m').value))
+        mask = mpl.footprint_mask(shape, poly)
+        if mask is None:
+            return None
+        # Refuse to search inside a rectangle that has stopped covering
+        # anything dark. Without this a wrong pose is self-sustaining: it
+        # projects a rectangle somewhere wrong, the search obligingly finds
+        # ports in it, the match verifies, and the miss counter that was meant
+        # to let go never counts anything. Checked before the search rather
+        # than after, so the fallback costs one frame rather than track_max_miss.
+        ok, ratio = mpl.looks_like_part(
+            self.grey, mask,
+            max_ratio=float(self.get_parameter('max_part_brightness').value))
+        if not ok:
+            self.get_logger().warn(
+                f'the tracked footprint is no darker than its surroundings '
+                f'({ratio:.2f}) -- it is not on the panel; dropping it and '
+                f'searching the image again', throttle_duration_sec=5)
+            self._last_pose = None
+            self._track_miss = 0
+            return None
+        return mask, poly, mpl.scale_from_pose(self.K, tvec), 'pose'
 
     def _estimate_mono(self):
         """-> (T_camera_object | None, info, debug context | None).
@@ -394,6 +476,12 @@ class DepthPoseNode(Node):
         which, and only then solve a pose. Detecting ports over the whole frame
         instead works on the bench and fails the moment anything else bright is
         in shot, and there always is.
+
+        "Find the part" has two answers and they are tried in that order. Once
+        a pose exists, the part is a known rectangle in a known place, so its
+        outline is projected rather than searched for -- see _tracked_mask.
+        Only a run that has not started, or one that has lost the part, falls
+        back to picking a dark region out of the image.
         """
         grey, bgr = self.grey, self.bgr
         ports = self.ref['ports']
@@ -403,38 +491,76 @@ class DepthPoseNode(Node):
         # a cable and a monitor bezel have between them outscored the real panel
         # on brightness and shape -- they are all just dark rectangles -- so the
         # blobs are tried in order and the first one that yields ports wins.
-        blobs = mpl.platform_candidates(grey)
-        if not blobs:
-            return None, 'no dark part found in the frame', None
-        # Start from the blob that worked last time, for the same reason
-        # find_ports starts from the scale that worked last time.
-        prev_blob = getattr(self, '_last_blob', 0)
-        order = sorted(range(len(blobs)), key=lambda i: (i != prev_blob, i))
+        track = self._tracked_mask(grey.shape)
+        self._footprint = track[1] if track is not None else None
+        self._otsu_outline = None
+
+        def candidates():
+            """Where to look for ports, best bet first.
+
+            A generator, so the threshold pass is only paid for when the
+            projected rectangle does not register. Measured on this machine
+            platform_candidates is 43 ms of a 62 ms frame -- on a frame where
+            tracking holds, that is most of the budget spent computing an
+            answer that is then thrown away.
+
+            The blue outline in the debug view goes with it: no blue line means
+            the threshold was never consulted, which is the state to be in.
+            """
+            if track is not None:
+                yield track
+            blobs = mpl.platform_candidates(grey)
+            self._otsu_outline = blobs[0][1] if blobs else None
+            # Start from the blob that worked last time, for the same reason
+            # find_ports starts from the scale that worked last time.
+            prev_blob = getattr(self, '_last_blob', 0)
+            for k in sorted(range(len(blobs)), key=lambda i: (i != prev_blob, i)):
+                m_, o_ = blobs[k]
+                hint = mpl.silhouette_scale(o_, self.ref['work_size_m'])
+                if hint:
+                    yield m_, o_, hint, f'blob{k + 1}'
+
         mask = outline = px_hint = None
-        cands, match = [], None
-        for k in order:
-            m_, o_ = blobs[k]
-            hint = mpl.silhouette_scale(o_, self.ref['work_size_m'])
-            if not hint:
-                continue
+        cands, match, source, n_tried = [], None, None, 0
+        for m_, o_, hint, tag in candidates():
+            n_tried += 1
             c_, mt_ = mpl.find_ports(grey, m_, hint, ports, K=self.K,
                                      prefer=getattr(self, '_last_tried', None))
-            if mask is None:                    # keep the best-scoring for debug
+            if mask is None:                    # keep the first for debug
                 mask, outline, px_hint, cands = m_, o_, hint, c_
             if mt_ is not None and mt_.get('verified'):
-                mask, outline, px_hint, cands, match = m_, o_, hint, c_, mt_
-                self._last_blob = k
+                mask, outline, px_hint, cands, match, source = (
+                    m_, o_, hint, c_, mt_, tag)
                 self._last_tried = mt_.get('tried')
-                if k:
+                if tag.startswith('blob'):
+                    self._last_blob = int(tag[4:]) - 1
+                if tag not in ('pose', 'blob1'):
                     self.get_logger().info(
-                        f'the top dark blob held no ports; used candidate {k + 1} '
-                        f'of {len(blobs)}', throttle_duration_sec=10)
+                        f'the earlier candidates held no ports; registered '
+                        f'against {tag}', throttle_duration_sec=10)
                 break
-        ctx = (bgr, outline, cands, None, ports, None, None, None)
+        if not n_tried:
+            return None, 'no dark part found in the frame', None
+        ctx = (bgr, self._otsu_outline, cands, None, ports, None, None, None)
         if match is None:
-            return None, (f'no dark region registered against the {len(ports)}-port '
-                          f'CAD table ({len(blobs)} tried, best had {len(cands)} '
-                          f'port candidates)'), ctx
+            # Give up on a tracked pose only after several empty frames. This
+            # is the price of tracking anything: a wrong pose projects a wrong
+            # rectangle, ports get found inside it, and the mistake confirms
+            # itself. Letting go after a few blank frames is what keeps that
+            # from being permanent -- and holding on for a few is what keeps a
+            # hand passing over the panel from restarting the search.
+            self._track_miss += 1
+            if (self._last_pose is not None and self._track_miss
+                    >= int(self.get_parameter('track_max_miss').value)):
+                self.get_logger().warn(
+                    f'{self._track_miss} frames with nothing matched -- '
+                    f'dropping the tracked pose and searching the whole image '
+                    f'again')
+                self._last_pose = None
+                self._footprint = None
+            return None, (f'no region registered against the {len(ports)}-port '
+                          f'CAD table ({n_tried} tried, best had '
+                          f'{len(cands)} port candidates)'), ctx
 
         img = np.array([cands[di]['centre'] for _, di in match['pairs']])
         sol = mpl.solve_pose(match['pairs'], ports, img, self.K)
@@ -484,11 +610,49 @@ class DepthPoseNode(Node):
                         '-- keeping the image-only pose', throttle_duration_sec=10)
                 self._tilt = tilt
 
-        ctx = (bgr, outline, cands, match['pairs'], ports, img, rvec, tvec)
+        # Everything above scores this frame against evidence drawn from the
+        # frame itself, which is exactly why a pose on the bench can pass it
+        # all. One check remains that does not: the part is black. Apply it
+        # before the pose is published or handed to the next frame, so a false
+        # lock is neither acted on nor allowed to perpetuate itself.
+        footprint = mpl.cad_footprint(
+            rvec, tvec, self.K, self.ref['work_size_m'],
+            float(ports[0]['centre'][2]),
+            margin_m=float(self.get_parameter('track_margin_m').value))
+        fp_mask = mpl.footprint_mask(grey.shape, footprint)
+        if fp_mask is None:
+            # None of the rectangle landed on the frame, so there is nothing to
+            # judge it by and nothing worth drawing.
+            footprint = None
+        else:
+            ok, ratio = mpl.looks_like_part(
+                grey, fp_mask,
+                max_ratio=float(self.get_parameter('max_part_brightness').value))
+            if not ok:
+                self._footprint = footprint     # draw it, so the miss is visible
+                self._last_pose = None
+                self._track_miss = 0
+                return None, (f'{match["n_matched"]}/{match["n_cad"]} ports '
+                              f'matched and the pose reprojects, but what it '
+                              f'covers is {ratio:.2f} as bright as its '
+                              f'surroundings -- the panel is black, so this is '
+                              f'somewhere else'), ctx
+
+        # Hand this pose to the next frame, and redraw the rectangle from it
+        # rather than from the one that was used to find these ports -- what is
+        # worth seeing is where the part is now, not where it was.
+        self._last_pose = (rvec, tvec)
+        self._track_miss = 0
+        self._footprint = footprint
+
+        ctx = (bgr, self._otsu_outline, cands, match['pairs'], ports, img,
+               rvec, tvec)
         mm_per_px = float(tvec.ravel()[2]) / self.K[0, 0] * 1000
         info = (f"{match['n_matched']}/{match['n_cad']} ports matched, "
                 f"reprojection {err:.2f} px ({err * mm_per_px:.2f} mm), "
-                f"range {tvec.ravel()[2] * 1000:.0f} mm")
+                f"range {tvec.ravel()[2] * 1000:.0f} mm, "
+                f"searched the {'projected footprint' if source == 'pose' else source} "
+                f"at {px_hint:.0f} px/m")
         if getattr(self, '_tilt', None) is not None:
             info += f', tilt agrees with depth to {self._tilt:.1f} deg'
         return mpl.pose_matrix(rvec, tvec), info, ctx
