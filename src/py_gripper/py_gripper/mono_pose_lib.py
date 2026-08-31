@@ -99,103 +99,6 @@ def silhouette_scale(outline, work_size_m):
     return 0.5 * (obs[0] / cad[0] + obs[1] / cad[1])
 
 
-def scale_from_pose(K, tvec):
-    """Pixels per metre on the port face, from the solve that measured it.
-
-    The same quantity silhouette_scale estimates, taken from the pose instead:
-    a length L at range Z covers L*fx/Z pixels, exactly.
-
-    Worth having even when the segmentation is clean. Measured on both captured
-    frames the silhouette reads 12-15% high -- it traces the part's whole
-    outline, and the raised handle stands closer to the camera than the port
-    face does. That has never mattered, because the matcher tolerates a third.
-    What does matter is that the silhouette is only ever as good as the
-    segmentation: a blob merged with a remote control lying alongside measured
-    8921 px/m against a true 4092, which fails the matcher's scale gate
-    outright and leaves the retry ladder to recover the frame.
-    """
-    z = float(np.ravel(tvec)[2])
-    return None if z <= 1e-6 else float(K[0, 0]) / z
-
-
-def cad_footprint(rvec, tvec, K, work_size_m, face_z, dist=None,
-                  margin_m=0.010):
-    """The part's own rectangle, projected from a pose. -> contour or None.
-
-    Where every stage above asks the image "which dark region is the part",
-    this answers from the model: the part is a known rectangle, the pose says
-    where that rectangle is, so project it. Nothing in the frame can join it to
-    the gripper's body or to a remote control on the bench alongside, because
-    it is not read out of the frame at all.
-
-    That is the whole point. Those two failures are dark objects touching the
-    part *in projection* -- the remote sits beside it on the bench, so they are
-    at much the same range and no depth gate separates them either -- and a
-    threshold has nothing left to tell them apart with.
-
-    `margin_m` widens the rectangle, and there is room to be generous: the
-    nearest port centre sits 19 mm inside the short edge and 25 mm inside the
-    long one, against ports around 7 mm in half-width. A centimetre of slack
-    costs nothing and covers the pose error that produced it.
-    """
-    dist = np.zeros(5) if dist is None else dist
-    w = float(work_size_m[0]) + 2.0 * margin_m
-    h = float(work_size_m[1]) + 2.0 * margin_m
-    corners = np.array([[-w / 2, -h / 2, face_z], [w / 2, -h / 2, face_z],
-                        [w / 2, h / 2, face_z], [-w / 2, h / 2, face_z]],
-                       dtype=np.float64)
-    pts, _ = cv2.projectPoints(corners, rvec, tvec, K, dist)
-    if not np.all(np.isfinite(pts)):
-        return None
-    return np.round(pts.reshape(-1, 1, 2)).astype(np.int32)
-
-
-def looks_like_part(grey, mask, max_ratio=0.6, min_outside=5000):
-    """Is what is inside this mask markedly darker than what surrounds it?
-
-    -> (ok, ratio). A cheap sanity check on a pose, and the only one available
-    that does not come from the same evidence the pose was built on.
-
-    Reprojection error and the matched count cannot catch a pose that is simply
-    somewhere else. Wood grain and bench clutter offer plenty of small dark
-    marks, and the correspondence search is exhaustive: give it enough blobs
-    and it will find six that fit the CAD pattern to within tolerance, solve a
-    pose through them, and reproject beautifully. Every score the pipeline has
-    says that frame went well.
-
-    What such a pose cannot do is be dark. This panel is matte black on a pale
-    bench, and that is a fact about the hardware rather than about the
-    detection. Measured on both captured frames the true footprint sits at 0.24
-    and 0.15 of its surroundings; the same rectangle shifted onto the bench
-    reads 0.92 to 1.08 across six placements. Nothing lands in between.
-
-    Compared against what is outside the mask rather than against the whole
-    frame, so that a panel filling most of the view is not judged against
-    itself.
-    """
-    inside = grey[mask > 0]
-    outside = grey[mask == 0]
-    if inside.size < 100 or outside.size < min_outside:
-        return True, float('nan')       # nothing to compare against; do not judge
-    out = float(np.median(outside))
-    ratio = float(np.median(inside)) / max(out, 1.0)
-    return ratio < max_ratio, ratio
-
-
-def footprint_mask(shape, poly):
-    """Fill a projected footprint. -> uint8 mask, or None if none of it lands.
-
-    None rather than an empty mask when the rectangle projects entirely off
-    frame, so the caller falls back to searching the image instead of searching
-    nothing and reporting that it found nothing.
-    """
-    if poly is None:
-        return None
-    m = np.zeros(shape[:2], np.uint8)
-    cv2.fillPoly(m, [poly.reshape(-1, 2)], 255)
-    return m if m.any() else None
-
-
 # --------------------------------------------------------------- the ports
 
 def _adaptive_block(px_per_m, cad_ports, span=6.0, lo=15, hi=151):
@@ -750,8 +653,7 @@ def pose_matrix(rvec, tvec):
 # ---------------------------------------------------------------- bring-up
 
 def debug_image(bgr, outline, candidates, pairs, cad_ports, image_points,
-                rvec, tvec, K, dist=None, target=None, max_side=700,
-                crop_pad=40, footprint=None):
+                rvec, tvec, K, dist=None, target=None, max_side=700, crop_pad=40):
     """What the detector saw, drawn on the frame it saw it in.
 
     The depth route drew its debug view on the rectified grid, which is honest
@@ -759,19 +661,11 @@ def debug_image(bgr, outline, candidates, pairs, cad_ports, image_points,
     front of you. Here the annotation goes on the camera image, so a wrong
     correspondence -- the failure that matters, because it is the one that reads
     as success -- is obvious at a glance: the label sits on the wrong socket.
-
-    Two outlines, when there is a pose to draw the second from. Blue is the
-    dark region a threshold picked out; yellow is the part's own rectangle
-    projected from the pose. Drawing both separates a segmentation that has
-    swallowed half the bench from a pose that is actually wrong, which look
-    identical when only the first is on screen.
     """
     dist = np.zeros(5) if dist is None else dist
     vis = bgr.copy()
     if outline is not None:
         cv2.drawContours(vis, [outline], -1, (255, 128, 0), 2)
-    if footprint is not None:
-        cv2.polylines(vis, [footprint], True, (0, 255, 255), 2)
     for c in candidates:
         cv2.circle(vis, tuple(np.round(c['centre']).astype(int)), 4, (110, 110, 110), 1)
 
@@ -798,23 +692,11 @@ def debug_image(bgr, outline, candidates, pairs, cad_ports, image_points,
     # crop to the part before scaling: the panel covers a quarter of the frame at
     # working distance, and a whole-frame thumbnail leaves the labels unreadable
     # on the phone the stream usually gets watched on
-    # Crop to the footprint when there is one: it is the part and nothing else,
-    # where the threshold's outline may have run off across the bench.
-    #
-    # Clamped, and abandoned rather than forced. A contour traced out of the
-    # image is inside it by construction; a projected footprint is not, and can
-    # sit wholly off any edge. Left unchecked that crops to an empty array,
-    # which is not a small picture -- cv2.imencode raises on it, from inside a
-    # subscription callback, which takes the node down and freezes the very
-    # stream this view exists to provide.
-    crop_to = footprint if footprint is not None else outline
-    if crop_to is not None and crop_pad is not None:
+    if outline is not None and crop_pad is not None:
+        x, y, w, h = cv2.boundingRect(outline)
         H, W = vis.shape[:2]
-        x, y, w, h = cv2.boundingRect(crop_to)
-        x0, y0 = max(0, x - crop_pad), max(0, y - crop_pad)
-        x1, y1 = min(W, x + w + crop_pad), min(H, y + h + crop_pad)
-        if x1 - x0 >= 16 and y1 - y0 >= 16:
-            vis = vis[y0:y1, x0:x1]                 # else keep the whole frame
+        vis = vis[max(0, y - crop_pad):min(H, y + h + crop_pad),
+                  max(0, x - crop_pad):min(W, x + w + crop_pad)]
     scale = max_side / max(vis.shape[:2])
     if scale < 1.0:
         vis = cv2.resize(vis, None, fx=scale, fy=scale,
