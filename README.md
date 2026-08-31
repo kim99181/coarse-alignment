@@ -23,14 +23,12 @@ git clone -b humble https://github.com/TechmanRobotInc/tm2_ros2.git src/tm2_ros2
 
 ## How the pose is found
 
-One greyscale frame and the CAD, per frame. Measured on hardware at about
-27 Hz before the part was tracked; the pipeline itself now costs around 20 ms
-a frame, so the 30 fps camera is what limits it:
+One greyscale frame and the CAD, per frame, at about 27 Hz:
 
-1. **Find the panel** — its own rectangle, projected from the previous frame's
-   pose. Only a run that has not started, or one that has lost the panel, falls
-   back to Otsu over the whole frame, where the largest *solid* blob wins
-   rather than the largest one. See *Tracking the part* below.
+1. **Find the panel** — Otsu over the whole frame. It is black on a pale bench,
+   which is the easiest threshold in the pipeline. The largest *solid* blob
+   wins, not the largest one; cables are darker still but fill a fraction of
+   their bounding box.
 2. **Find the ports** — adaptive threshold inside the panel only, with the
    neighbourhood sized from the working distance. Deliberately over-detects.
 3. **Decide which port is which** — two blobs paired with two CAD ports fix a
@@ -48,47 +46,6 @@ position, scale, heading, which port is which -- is image and CAD only. On a
 matte black panel that is the point: its depth returns cannot carry a scale.
 
 Measured on hardware: 8 of 8 ports matched, 0.75 mm mean reprojection.
-
-### Tracking the part
-
-A threshold cannot separate the panel from anything dark it touches, and on a
-bench something usually does: the gripper's own body, a cable, a remote control
-lying alongside. Nor does depth separate the last of those -- the panel stands
-5 cm proud and the remote is about as thick, so they sit at much the same
-range. The silhouette has been seen to run from the panel across a pendant, a
-cable and two board edges as one connected blob.
-
-The blob itself is survivable. The scale taken from it is not: on one such
-frame it read 8921 px/m against a true 4092, and the matcher rejects a scale a
-third out, so every correct hypothesis was discarded and the retry ladder left
-to recover the frame at four times the cost.
-
-So once a pose exists, the question is not asked again. The panel is a known
-rectangle in a known place, so it is projected rather than searched for, and
-the scale comes from the same pose as `fx/Z` -- exact, where the silhouette
-reads 12-15% high even on a clean frame, because it traces the whole outline
-and the raised handle stands nearer the camera than the port face. Since the
-threshold's answer is then unused, it is not computed: it was 43 ms of a 62 ms
-frame. Measured over the captured frames, 66.5 -> 20.8 ms on a clean one and
-133 -> 20.3 ms on a merged one.
-
-Anything tracked can lock onto the wrong thing and then confirm itself, and
-this did: a pose settled on wood grain, projected its rectangle there, found
-ports inside it and reprojected cleanly. Nothing already in the pipeline
-catches that, because reprojection error and match count are both scored
-against the frame the pose was built from. One fact is independent of the
-detection -- the panel is black. Its footprint measures 0.15-0.24 of its
-surroundings; the same rectangle shifted onto the bench reads 0.92-1.09 across
-six placements, with nothing in between. A pose over something bright is
-refused before it is published, and a tracked rectangle that has stopped
-covering anything dark is dropped on the frame it happens.
-
-| parameter | |
-|---|---|
-| `track_mask` | false restores the previous behaviour in full |
-| `track_margin_m` | slack around the projected rectangle (default 0.010) |
-| `track_max_miss` | frames with nothing matched before the pose is dropped and the whole image searched again (default 5) |
-| `max_part_brightness` | how bright the footprint may be against its surroundings and still be believed (default 0.6); above 1 switches the check off |
 
 ## Running it
 
@@ -194,14 +151,6 @@ Port names come from the CAD table: `usb1`-`usb4`, `rj451`, `rj452`,
 detection and the raw camera frame side by side -- the raw one because a frame
 that produced no pose carries almost no annotation, which is exactly when you
 need to see what the detector was given.
-
-Two outlines on the annotated view. Yellow is the panel's own rectangle
-projected from the pose; blue is the dark region a threshold picked out. **No
-blue line is the state to be in** -- it means tracking is holding and the
-threshold was never run. Blue appearing on its own is a run starting or
-recovering; blue sprawling across the bench while yellow hugs the panel is the
-segmentation failing harmlessly, which is the difference the two colours exist
-to show.
 
 ### Running a whole cycle
 
